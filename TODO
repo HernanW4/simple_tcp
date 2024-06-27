@@ -1,0 +1,15 @@
+
+[] Make a TcpPacket move between Server and Client. 
+    [] Work on logic
+    [] Make packet contain a version
+    [] Packet shall have a command
+        Command is a char that tells the server/client what type of packet this is.
+        Ex:
+            Echo Packet,
+            Data Packet,
+            Disconnect Packet
+    [] Packet shall contain the data along with how long the data is
+    [] Packet shall also contain the author and target for such packet
+
+
+
