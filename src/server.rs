@@ -1,18 +1,22 @@
+use core::panic;
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    sync::mpsc,
+    sync::{
+        mpsc::{self, Receiver},
+        Arc, Mutex,
+    },
     thread,
 };
 
+use bincode::deserialize;
+
 use crate::errors::{Error, Result};
-use crate::Data;
+use crate::{Data, TcpPacket};
 
 pub struct Server {
     listen_addr: String,
     ln: Option<TcpListener>,
-    sender: mpsc::Sender<Data>,
-    receiver: Option<mpsc::Receiver<Data>>,
 }
 
 impl Server {
@@ -21,15 +25,11 @@ impl Server {
             return Err(Error::InvalidAddress(addr));
         }
 
-        let (tx, rx) = mpsc::channel::<Data>();
-
-        log::info!("Server has started at: {addr}");
+        log::info!("Server has been initialized at: {addr}");
 
         Ok(Server {
             listen_addr: addr,
             ln: None,
-            sender: tx,
-            receiver: Some(rx),
         })
     }
 
@@ -38,15 +38,7 @@ impl Server {
 
         self.ln = Some(listener);
 
-        if let Some(rx) = self.receiver.take() {
-            thread::spawn(move || {
-                for msg in rx {
-                    let content = msg.content.unwrap_or("No content in Data".to_string());
-                }
-            });
-        } else {
-            return Err(Error::ServerReceiverNotFound);
-        }
+        log::info!("Server has started and is reading connections");
 
         self.accept_loop().expect("Error at accepting connections");
 
@@ -58,13 +50,25 @@ impl Server {
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
-                        let tx = self.sender.clone();
+                        log::debug!(
+                            "New connection established from {}",
+                            stream.peer_addr().unwrap()
+                        );
+
+                        let (tx, rx) = mpsc::channel();
+                        let stream = Arc::new(Mutex::new(stream));
+                        let read_stream = Arc::clone(&stream);
+                        let write_stream = Arc::clone(&stream);
+
                         thread::spawn(move || {
-                            read_stream(stream, tx);
+                            hangle_read(read_stream, tx);
+                        });
+                        thread::spawn(move || {
+                            handle_write(write_stream, rx);
                         });
                     }
                     Err(e) => {
-                        println!("Error at getting stream: {e}");
+                        eprintln!("Error at getting stream: {e}");
                     }
                 }
             }
@@ -75,35 +79,86 @@ impl Server {
         Ok(())
     }
 }
-fn read_stream(mut stream: TcpStream, tx: mpsc::Sender<Data>) {
-    let mut buf = [0; 1024];
 
-    let client_addr = stream
-        .peer_addr()
-        .expect("Could not identify the address of client");
+fn handle_write(stream: Arc<Mutex<TcpStream>>, rx: Receiver<TcpPacket>) {
+    //TODO: No unwrap
     loop {
+        let packet = rx.recv().unwrap();
+        let data = packet.data;
+
+        let packet_bytes = bincode::serialize(&data).unwrap();
+        let length = packet_bytes.len() as u8;
+        let version = 1;
+        let command = 'e';
+
+        let packet = TcpPacket {
+            version,
+            command,
+            length,
+            data,
+        };
+
+        let packet_bytes = bincode::serialize(&packet).unwrap();
+
+        let mut stream = stream.lock().unwrap();
+
+        match stream.write(&packet_bytes) {
+            Ok(0) => {
+                log::debug!("Client disconnected");
+            }
+            Ok(n) => {
+                log::debug!("Wrote {n} bytes");
+            }
+            Err(e) => {
+                log::debug!("Something went wrong here {e}");
+            }
+        }
+        stream.flush().unwrap();
+    }
+}
+
+fn hangle_read(stream: Arc<Mutex<TcpStream>>, tx: mpsc::Sender<TcpPacket>) {
+    let mut buf = [0; 1024];
+    loop {
+        let mut bytes_read = 0;
+        let mut stream = stream.lock().unwrap();
+        let client_addr = stream.peer_addr().unwrap();
+
+        //TODO: Make it so client can say by
         match stream.read(&mut buf) {
-            Ok(n) if n <= 2 => {
-                println!("Client: {client_addr} has disconnected!");
+            Ok(0) => {
+                log::debug!("Client: {client_addr} has disconnected!");
                 return;
             }
             Ok(n) => {
-                let client_msg: String = String::from_utf8_lossy(&buf[..n]).to_string();
-
-                let echo_msg = format!("Echo: {client_msg}");
-
-                let msg = Data::new(echo_msg.len() as u8, Some(client_msg));
-
-                tx.send(msg).unwrap();
+                let echo_msg = format!("Echo: {}", client_addr.to_string());
+                log::debug!("Client sent a packet with {n} bytes");
+                bytes_read = n;
 
                 //Echo Data to client
                 stream.write_all(echo_msg.as_bytes()).unwrap();
             }
 
             Err(e) => {
-                println!("Error reading from client {e}");
+                eprintln!("Error reading from client {e}");
             }
         }
+        //let client_msg: String = String::from_utf8_lossy(&buf[..n]).to_string();
+        //
+        //
+        let packet: TcpPacket = deserialize(&buf[..bytes_read]).unwrap();
+
+        log::debug!("Version received: {}", packet.version);
+        assert!(packet.version == 1, "Wrong version of packet");
+        assert!(
+            packet.length as usize == bytes_read - 3,
+            "Length of data does not match of packet signature"
+        );
+
+        //tx.send(packet).unwrap();
+        //
+        println!("{:?}", packet);
+
         stream.flush().unwrap();
     }
 }

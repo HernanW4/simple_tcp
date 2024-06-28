@@ -1,6 +1,9 @@
+use env_logger;
 use simple_tcp::server::Server;
 
 fn main() {
+    env_logger::init();
+
     let mut server = Server::new("127.0.0.1:42069".to_string()).expect("Failed at creating server");
 
     match server.start_server() {

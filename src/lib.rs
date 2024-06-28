@@ -9,24 +9,29 @@ use anyhow::Result;
 mod errors;
 pub mod server;
 
-//My visualization of what a TCP packet should look like
-//Structure of the packet sent through server
-//
-struct Data {
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Data {
     content: Option<String>,
-    length: u8,
+    source_addr: String,
+    target_addr: String,
 }
 
 impl Data {
-    pub fn new(length: u8, content: Option<String>) -> Self {
-        Data { length, content }
+    pub fn new(content: Option<String>, source_addr: String, target_addr: String) -> Self {
+        Data {
+            content,
+            source_addr,
+            target_addr,
+        }
     }
 }
+
+#[derive(Debug, Serialize, Deserialize)]
 struct TcpPacket {
     version: u8,
-    command: Vec<u8>,
+    command: char,
     length: u8,
-    data: Vec<u8>,
+    data: Data,
 }
 
 pub struct Client {
@@ -81,13 +86,31 @@ impl Client {
         let mut buf = [0; 1024];
         if let Some(ref mut stream) = self.stream {
             loop {
-                match stream.read(&mut buf) {
+                let msg = String::from("Hi from client");
+                let source_addr = stream.local_addr().unwrap().to_string();
+                let target_addr = stream.peer_addr().unwrap().to_string();
+
+                let data = Data::new(Some(msg), source_addr, target_addr);
+                let length = bincode::serialize(&data).unwrap().len() as u8;
+
+                let version = 1;
+                let command = 'e';
+
+                let packet = TcpPacket {
+                    version,
+                    command,
+                    length,
+                    data,
+                };
+
+                let buf = bincode::serialize(&packet).unwrap();
+
+                match stream.write(&buf) {
                     Ok(0) => {
                         tx.send("Server Disconnected".to_string()).unwrap();
                     }
                     Ok(n) => {
-                        let server_msg = String::from_utf8_lossy(&buf[..n]).to_string();
-                        tx.send(server_msg).unwrap();
+                        println!("Packet sent to server {n} bytes");
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                         let echo = "Echo server".as_bytes();
@@ -98,6 +121,8 @@ impl Client {
                         println!("Error at reading from server {e}");
                     }
                 }
+
+                stream.flush().unwrap();
 
                 thread::sleep(Duration::from_secs(5));
             }
