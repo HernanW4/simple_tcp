@@ -1,4 +1,4 @@
-use simple_tcp::Client;
+use simple_tcp::client::Client;
 
 fn main() {
     let mut client = Client::new("127.0.0.1:42069".to_string());
