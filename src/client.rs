@@ -6,19 +6,22 @@ use std::{io::Write, net::TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rand::Rng;
+
 use crate::errors::{Error, Result};
-use crate::{Data, PacketType, Status, TcpPacket};
+use crate::utils::{packet_handling::*, StreamHandler};
+use crate::{ConnectionState, Data, PacketType, TcpPacket, PACKET_VERSION};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 
-pub struct Client<'a> {
+pub struct Client {
     //Change
     pub destination_addr: String,
     stream: TcpStream,
-    status: Status<'a>,
+    status: ConnectionState,
 }
 
-impl<'a> Client<'a> {
+impl Client {
     pub fn new(addr: String) -> Result<Self> {
         if let Ok(stream) = TcpStream::connect(&addr) {
             stream
@@ -27,7 +30,7 @@ impl<'a> Client<'a> {
             Ok(Client {
                 destination_addr: addr,
                 stream,
-                status: Status::AwaitingResponse(PacketType::Echo),
+                status: ConnectionState::Closed,
             })
         } else {
             Err(Error::Custom(
@@ -37,80 +40,68 @@ impl<'a> Client<'a> {
     }
 
     pub fn run(&mut self) -> Result<()> {
-        println!("H");
         let mut last_activity = Instant::now();
-
-        let mut buf: [u8; 1024] = [0; 1024];
 
         let timeout = Duration::from_secs(7);
         let mut tries = 0;
 
+        let mut client_seq: u32 = rand::thread_rng().gen_range(0..500);
+        let mut client_ack: u32 = 0;
+
         //Main client loop
         loop {
+            log::info!("Status: {:?}", self.status);
+
             match self.status {
-                Status::AwaitingResponse(PacketType::Echo) if last_activity.elapsed() > timeout => {
-                    if tries < 3 {
-                        log::debug!("Checking with server again!");
-                        self.status = Status::SendData(PacketType::Echo, None);
-                        tries += 1;
-                        last_activity = Instant::now();
-                    } else {
-                        self.status = Status::Disconnect;
-                        tries = 0;
-                    }
+                ConnectionState::Closed => {
+                    let packet = TcpPacket {
+                        version: 1,
+                        packet_type: PacketType::Syn,
+                        seq_num: client_seq,
+                        ack_num: 0,
+                        data: None,
+                    };
+
+                    send_packet(&mut self.stream, packet)?;
+                    self.status = ConnectionState::SynSent;
                 }
-                Status::AwaitingResponse(PacketType::Echo) => {
-                    let bytes_read = Self::read_from_stream(&mut self.stream, &mut buf)
-                        .map_err(|_| Error::Custom("Could not read from stream".to_string()))?;
+                ConnectionState::SynSent => {
+                    let bytes_read = receive_packet(&mut self.stream)?;
+                    let packet_recv: TcpPacket = deserialize_packet_bytes(&bytes_read)?;
 
-                    if bytes_read == 0 {
-                        self.status = Status::Disconnect;
-                    } else if bytes_read > 1 {
-                        if let Ok((packet_type, data)) = Self::process_bytes(&buf) {
-                            match packet_type {
-                                PacketType::Echo => {
-                                    self.status = Status::SendData(PacketType::Echo, None);
-                                }
-                                PacketType::Data => {
-                                    log::debug!("I have received Data! {:?}", data);
-                                }
-                                PacketType::Disconnect => {
-                                    log::debug!("Disconnecting from server");
-                                    return Ok(());
-                                }
-                                _ => todo!(),
-                            }
+                    assert!(
+                        packet_recv.version == PACKET_VERSION,
+                        "Packet version not supported"
+                    );
 
-                            last_activity = Instant::now();
-                            tries = 0;
-                        }
+                    assert!(
+                        packet_recv.packet_type == PacketType::SynAck,
+                        "Wrong packet type"
+                    );
+
+                    if packet_recv.ack_num != client_seq + 1 {
+                        log::error!("Server sent wrong ACK number. Disconnecting...");
+                        return Ok(());
                     }
+
+                    log::debug!("Packet Rcv: {:?}", packet_recv);
+
+                    let packet = TcpPacket {
+                        version: PACKET_VERSION,
+                        packet_type: PacketType::Ack,
+                        seq_num: client_seq + 1,
+                        ack_num: packet_recv.seq_num + 1,
+                        data: None,
+                    };
+
+                    log::debug!("Packet Sent: {:?}", packet);
+                    send_packet(&mut self.stream, packet)?;
+                    self.status = ConnectionState::Established;
                 }
-
-                Status::AwaitingResponse(PacketType::Data) => {}
-
-                Status::SendData(PacketType::Echo, _) => {
-                    let buf = Self::data_to_packet(PacketType::Echo, None).map_err(|_| {
-                        Error::Custom("Could not convert data to packer".to_string())
-                    })?;
-
-                    let bytes = Self::write_to_stream(&mut self.stream, &buf)
-                        .map_err(|_| Error::Custom("Error at writing to stream".to_string()))?;
-
-                    if bytes <= 0 {
-                        log::warn!(
-                            "Something went wrong when writing to server. Wrote {bytes} bytes"
-                        );
-                    }
-                    log::debug!("Succesfully sent {bytes} bytes to server!!");
-                    last_activity = Instant::now();
-                    self.status = Status::AwaitingResponse(PacketType::Echo);
-                }
-
-                Status::SendData(PacketType::Data, Some(data)) => {}
-
-                Status::Disconnect => {
-                    log::warn!("Disconnecting from server");
+                ConnectionState::Established => {
+                    let server_addr = self.stream.peer_addr()?;
+                    log::debug!("You are fully connected to server {server_addr}");
+                    log::warn!("Disconnecting now due to poor development");
                     return Ok(());
                 }
 
@@ -118,98 +109,6 @@ impl<'a> Client<'a> {
             }
 
             self.stream.flush().expect("Could not flush stream");
-            buf = [0; 1024];
-        }
-    }
-
-    fn data_to_packet(packet_type: PacketType, data: Option<Data>) -> Result<Vec<u8>> {
-        let data_len = bincode::serialize(&data)
-            .map_err(|_| Error::Custom("Could not serialize data".to_string()))?
-            .len();
-
-        let tcp_packet = TcpPacket {
-            version: 1,
-            packet_type,
-            length: data_len as u8,
-            data,
-        };
-
-        bincode::serialize(&tcp_packet)
-            .map_err(|_| Error::Custom("Couldn't serialize tcp packet".to_string()))
-    }
-
-    fn write_to_stream(stream: &mut TcpStream, buf: &[u8]) -> Result<usize> {
-        let mut bytes_written = 0;
-
-        match stream.write(buf) {
-            Ok(0) => {
-                log::error!("Disconnect? ");
-            }
-            Ok(n) => {
-                log::debug!("Writtent {n} bytes to server!");
-                bytes_written = n;
-            }
-            Err(e) => {
-                log::error!("Something went wrong when writing to server{e}")
-            }
-        }
-
-        stream.flush().expect("Could not flush stream");
-
-        Ok(bytes_written)
-    }
-
-    fn read_from_stream(stream: &mut TcpStream, buf: &mut [u8]) -> Result<usize> {
-        let mut len = 1;
-
-        match stream.read(buf) {
-            Ok(0) => {
-                log::warn!("Server has shutdown or disconnected");
-                return Ok(0);
-            }
-            Ok(n) => {
-                len = n;
-                log::debug!("Received message from server {n} bytes");
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                log::warn!("Read timeout reached!");
-            }
-            Err(e) => {
-                log::error!("Error at reading stream: {e}");
-            }
-        }
-
-        Ok(len)
-    }
-
-    fn process_bytes(buf: &[u8; 1024]) -> Result<(PacketType, Option<Data>)> {
-        let packet: TcpPacket = bincode::deserialize(buf)
-            .map_err(|e| Error::Custom(format!("Could not deserialize bytes to TcpPacket: {e}")))?;
-        log::debug!("Received packet: {:?}", packet);
-
-        assert!(packet.version == 1, "Wrong packet version used");
-
-        let data_len = bincode::serialize(&packet.data)
-            .map_err(|_| Error::Custom("Could not serialize data of packet".to_string()))?
-            .len();
-
-        match packet.packet_type {
-            PacketType::Echo => {
-                let packet_type = packet.packet_type;
-
-                Ok((packet_type, None))
-            }
-            PacketType::Data => {
-                let packet_type = packet.packet_type;
-                let data = packet.data;
-                assert!(
-                    packet.length == data_len as u8,
-                    "Packet's length does not match the data's"
-                );
-                Ok((packet_type, data))
-            }
-            PacketType::Disconnect => Ok((PacketType::Disconnect, None)),
-            _ => todo!(),
         }
     }
 }

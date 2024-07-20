@@ -7,20 +7,21 @@ use std::{
     time::{Duration, Instant},
 };
 
+use rand::Rng;
+
+use crate::utils::{packet_handling::*, StreamHandler};
 use crate::{
     errors::{Error, Result},
-    PacketType, Status,
+    ConnectionState, PacketType,
 };
 use crate::{Data, TcpPacket};
 
 type ClientID = u32;
-type ClientPool = Arc<Mutex<HashMap<ClientID, Status<'static>>>>;
+type ClientPool = Arc<Mutex<HashMap<ClientID, ConnectionState>>>;
 
-pub struct Server<'a> {
-    listen_addr: String,
+pub struct Server {
     ln: Option<TcpListener>,
     client_pool: ClientPool,
-    phantom: std::marker::PhantomData<&'a str>,
 }
 
 //
@@ -30,7 +31,7 @@ pub struct Server<'a> {
 //}
 //
 
-impl<'a> Server<'a> {
+impl Server {
     pub fn new(addr: String) -> Result<Self> {
         if !addr.contains(":") {
             return Err(Error::InvalidAddress(addr));
@@ -38,19 +39,15 @@ impl<'a> Server<'a> {
 
         log::info!("Server has been initialized at: {addr}");
 
+        let listener = TcpListener::bind(addr)?;
+
         Ok(Server {
-            listen_addr: addr,
-            ln: None,
+            ln: Some(listener),
             client_pool: Arc::new(Mutex::new(HashMap::with_capacity(4))),
-            phantom: std::marker::PhantomData,
         })
     }
 
     pub fn start_server(&mut self) -> Result<()> {
-        let listener = TcpListener::bind(self.listen_addr.clone())?;
-
-        self.ln = Some(listener);
-
         log::info!("Server has started and is reading connections");
 
         self.accept_loop().expect("Error at accepting connections");
@@ -58,7 +55,7 @@ impl<'a> Server<'a> {
         Ok(())
     }
 
-    pub fn accept_loop(&mut self) -> Result<()> {
+    fn accept_loop(&mut self) -> Result<()> {
         let listener = self
             .ln
             .as_ref()
@@ -81,49 +78,23 @@ impl<'a> Server<'a> {
                     );
 
                     //let (tx, rx) = mpsc::channel();
-                    let stream = Arc::new(Mutex::new(stream));
+                    let mut stream = Arc::new(Mutex::new(stream));
 
                     {
                         let mut client_pool = pool.lock().map_err(|_| {
                             Error::Custom("Could not lock in client_pool".to_string())
                         })?;
 
-                        client_pool.insert(client_id, Status::SendData(PacketType::Echo, None));
+                        client_pool.insert(client_id, ConnectionState::Listen);
                     }
 
                     let pool_clone = Arc::clone(&pool);
 
                     thread::spawn(move || {
-                        if let Err(e) = Self::handle_client(client_id, stream, pool_clone) {
+                        if let Err(e) = Self::handle_client(client_id, &mut stream, pool_clone) {
                             log::error!("Error handling client {}: {:?}", client_id, e);
                         }
                     });
-
-                    //TODO
-                    //Handle clients
-                    //for (client, status) in self.client_pool{
-                    //    thread::spawn(move ||{
-                    //        match status{
-                    //            AwaitingResponse(response) => {
-                    //            },
-                    //            AwaitingEcho => {},
-                    //            SendData(msg) => {},
-                    //
-
-                    //        }
-
-                    //    });
-                    //}
-                    //match State{
-                    //    Read => {},
-                    //    Read if 5 secs passed => {
-                    //        Write(Echo)
-                    //    }
-                    //    Write(Echo) => {
-
-                    //    }
-                    //    _ => {Write("Hello")}
-                    //}
                 }
                 Err(e) => {
                     eprintln!("Error at accepting connection: {e}");
@@ -135,7 +106,7 @@ impl<'a> Server<'a> {
 
     fn handle_client(
         client_id: ClientID,
-        stream: Arc<Mutex<TcpStream>>,
+        stream: &mut Arc<Mutex<TcpStream>>,
         client_pool: ClientPool,
     ) -> Result<()> {
         let mut last_activity = Instant::now();
@@ -145,7 +116,9 @@ impl<'a> Server<'a> {
         let mut buf = [0; 1024];
 
         //Default Status after succesful connection
-        let mut status: Status = Status::AwaitingResponse(PacketType::Echo);
+        let mut status: ConnectionState = ConnectionState::Listen;
+        let mut server_seq_num = rand::thread_rng().gen_range(0..500);
+        let mut server_ack_num = 0;
         loop {
             {
                 let pool = client_pool.lock().map_err(|_| {
@@ -155,183 +128,69 @@ impl<'a> Server<'a> {
                     status = client_status.clone();
                 }
             }
+            log::info!("Status: {:?}", status);
 
             match status {
-                Status::AwaitingResponse(PacketType::Disconnect) => {
-                    Self::disconnect_client(client_id, &stream, &client_pool)?;
-                }
-                Status::AwaitingResponse(..) if last_activity.elapsed() > timeout => {
-                    Self::send_echo(client_id, &stream, &client_pool)?;
+                ConnectionState::Listen => {
+                    let buf_read = receive_packet(stream)?;
+                    let packet = deserialize_packet_bytes(&buf_read)?;
+
+                    server_ack_num = packet.seq_num + 1;
+
+                    log::debug!("Packet rcv{:?}", packet);
+
+                    let syn_ack_packet = TcpPacket {
+                        version: 1,
+                        packet_type: PacketType::SynAck,
+                        seq_num: server_seq_num,
+                        ack_num: server_ack_num,
+                        data: None,
+                    };
+                    log::debug!("Server packet: {:?}", syn_ack_packet);
+
+                    send_packet(stream, syn_ack_packet)?;
                     last_activity = Instant::now();
-                    response_tries += 1;
+
+                    status = ConnectionState::SynRecv;
                 }
-                Status::AwaitingResponse(..) if response_tries > 3 => {
-                    if let Err(e) = Self::disconnect_client(client_id, &stream, &client_pool) {
-                        log::error!(
-                            "Error at disconnecting client {} from client_pool: {:?}",
-                            client_id,
-                            e
+                ConnectionState::SynRecv => {
+                    let buf_read = receive_packet(stream)?;
+                    let packet = deserialize_packet_bytes(&buf_read)?;
+
+                    if packet.packet_type != PacketType::Ack {
+                        log::warn!(
+                            "Packet received from Client is not Ack: {:?} breaking handshake",
+                            packet.packet_type
                         );
+                        return Ok(());
                     }
-                    log::debug!("Client{client_id} disconnected due to inactivity");
+
+                    assert!(
+                        packet.ack_num == server_seq_num + 1,
+                        "Received ACK does not match sent SEQ"
+                    );
+
+                    log::debug!("{:?}", packet);
+                    status = ConnectionState::Established;
+                    last_activity = Instant::now();
+                }
+                ConnectionState::Established => {
+                    let client_addr = stream.peer_addr()?;
+                    log::debug!("Succesfully connected to client {client_id} addr: {client_addr}");
+                    log::debug!("But is time to say goodbye");
                     return Ok(());
                 }
-                Status::AwaitingResponse(packet_type) => {
-                    let bytes_read =
-                        Self::read_from_client(client_id, &stream, &mut buf, &client_pool)?;
 
-                    if bytes_read > 0 {
-                        log::debug!("Got message from client!");
-                        last_activity = Instant::now();
-                    }
-                }
-                Status::SendData(packet_type, data) => {
-                    Self::send_echo(client_id, &stream, &client_pool)?;
-                    log::debug!("Sent Echo package to client {client_id}");
-                    last_activity = Instant::now();
-                }
-                Status::SendData(PacketType::Data, Some(data)) => {}
-                _ => {
-                    todo!()
-                }
+                _ => {}
+            }
+
+            // Update client status in the pool
+            {
+                let mut pool = client_pool
+                    .lock()
+                    .map_err(|_| Error::Custom("Error at locking client pool".to_string()))?;
+                pool.insert(client_id, status.clone());
             }
         }
-    }
-
-    fn disconnect_client(
-        client_id: ClientID,
-        stream: &Arc<Mutex<TcpStream>>,
-        client_pool: &ClientPool,
-    ) -> Result<()> {
-        let disconnect_packet = TcpPacket {
-            version: 1,
-            packet_type: PacketType::Disconnect,
-            length: 0,
-            data: None,
-        };
-
-        let bytes = bincode::serialize(&disconnect_packet)
-            .map_err(|_| Error::Custom("Could not get bytes for disconnect packet".to_string()))?;
-
-        let mut stream = stream
-            .lock()
-            .map_err(|_| Error::Custom("Error at locking stream".to_string()))?;
-
-        if let Err(e) = stream.write_all(&bytes) {
-            log::error!(
-                "Could not send disconnect packet to client{}: {:?}",
-                client_id,
-                e
-            );
-        }
-
-        let mut pool = client_pool
-            .lock()
-            .map_err(|_| Error::Custom("Error at locking client_pool".to_string()))?;
-
-        pool.remove(&client_id);
-
-        log::debug!("Client {client_id} has been removed from pool");
-
-        Ok(())
-    }
-
-    fn read_from_client(
-        client_id: ClientID,
-        stream: &Arc<Mutex<TcpStream>>,
-        buf: &mut [u8; 1024],
-        client_pool: &ClientPool,
-    ) -> Result<usize> {
-        let mut stream = stream
-            .lock()
-            .map_err(|e| Error::Custom(format!("Error at locking stream {:?}", e)))?;
-
-        match stream.read(buf) {
-            Ok(0) => Ok(0),
-            Ok(n) => Ok(n),
-            Err(e) => Err(Error::Custom(format!(
-                "Error at reading from client{}: {:?}",
-                client_id, e
-            ))),
-        }
-    }
-    fn send_packet(
-        packet_type: PacketType,
-        data: Option<Data>,
-        client_id: ClientID,
-        stream: &Arc<Mutex<TcpStream>>,
-        client_pool: &ClientPool,
-    ) -> Result<()> {
-        let mut tcp_packet = TcpPacket::default();
-
-        match packet_type {
-            PacketType::Echo => {
-                tcp_packet = TcpPacket::echo_packet(1);
-            }
-            PacketType::Data => {
-                tcp_packet = TcpPacket::with_data(1, data)?;
-            }
-            PacketType::Disconnect => {}
-            _ => {}
-        }
-
-        let packet_bytes = bincode::serialize(&tcp_packet)
-            .map_err(|_| Error::Custom("Error at seraliazing echo packet".to_string()))?;
-
-        let mut stream = stream
-            .lock()
-            .map_err(|e| Error::Custom(format!("Error at locking stream {:?}", e)))?;
-
-        if let Err(e) = stream.write_all(&packet_bytes) {
-            log::error!("Could not send echo packet to client {client_id}: {:?}", e);
-        }
-
-        log::debug!("Echo msg sent to client:{client_id}");
-
-        let mut client_pool = client_pool
-            .lock()
-            .map_err(|_| Error::Custom("Could not lock client".to_string()))?;
-
-        if let Some(client_status) = client_pool.get_mut(&client_id) {
-            *client_status = Status::AwaitingResponse(PacketType::Echo);
-        }
-
-        Ok(())
-    }
-
-    fn send_echo(
-        client_id: ClientID,
-        stream: &Arc<Mutex<TcpStream>>,
-        client_pool: &ClientPool,
-    ) -> Result<()> {
-        let echo_packet = TcpPacket {
-            version: 1,
-            packet_type: PacketType::Echo,
-            length: 0,
-            data: None,
-        };
-
-        let packet_bytes = bincode::serialize(&echo_packet)
-            .map_err(|_| Error::Custom("Error at seraliazing echo packet".to_string()))?;
-
-        let mut stream = stream
-            .lock()
-            .map_err(|e| Error::Custom(format!("Error at locking stream {:?}", e)))?;
-
-        if let Err(e) = stream.write_all(&packet_bytes) {
-            log::error!("Could not send echo packet to client {client_id}: {:?}", e);
-        }
-
-        log::debug!("Echo msg sent to client:{client_id}");
-
-        let mut client_pool = client_pool
-            .lock()
-            .map_err(|_| Error::Custom("Could not lock client".to_string()))?;
-
-        if let Some(client_status) = client_pool.get_mut(&client_id) {
-            *client_status = Status::AwaitingResponse(PacketType::Echo);
-        }
-
-        Ok(())
     }
 }
