@@ -1,139 +1,215 @@
-use anyhow::Result;
-use std::io::Read;
+use std::io::{self, Read};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::{io::Write, net::TcpStream};
 
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::TcpPacket;
+use crate::errors::{Error, Result};
+use crate::{Data, PacketType, Status, TcpPacket};
 
-pub struct Client {
+const READ_TIMEOUT: Duration = Duration::from_secs(3);
+
+pub struct Client<'a> {
     //Change
     pub destination_addr: String,
-    stream: Option<TcpStream>,
+    stream: TcpStream,
+    status: Status<'a>,
 }
 
-impl Client {
-    pub fn new(addr: String) -> Self {
-        Self {
-            destination_addr: addr,
-            stream: None,
+impl<'a> Client<'a> {
+    pub fn new(addr: String) -> Result<Self> {
+        if let Ok(stream) = TcpStream::connect(&addr) {
+            stream
+                .set_read_timeout(Some(READ_TIMEOUT))
+                .map_err(|e| Error::IO(e))?;
+            Ok(Client {
+                destination_addr: addr,
+                stream,
+                status: Status::AwaitingResponse(PacketType::Echo),
+            })
+        } else {
+            Err(Error::Custom(
+                "Could not create a client with server address {addr}".to_string(),
+            ))
         }
     }
 
-    pub fn from_stream(stream: TcpStream) -> Self {
-        let addr = stream.local_addr().expect("Could not get peer address");
-        Self {
-            stream: Some(stream),
-            destination_addr: addr.to_string(),
-        }
-    }
+    pub fn run(&mut self) -> Result<()> {
+        println!("H");
+        let mut last_activity = Instant::now();
 
-    //Maybe?
-    //pub fn from_stream(stream: TcpStream) -> Self {
-    //    let address = stream.peer_addr().unwrap();
-    //    Client {
-    //        destination_addr: address,
-    //        stream,
-    //    }
-    //}
+        let mut buf: [u8; 1024] = [0; 1024];
 
-    pub fn connect_to_server(&mut self) -> Result<()> {
-        let server_addr = self.destination_addr.clone();
+        let timeout = Duration::from_secs(7);
+        let mut tries = 0;
 
-        println!("B");
-        let stream = TcpStream::connect(server_addr)?;
-
-        println!("C");
-
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-
-        self.stream = Some(stream);
-
-        println!("Before loop");
-
+        //Main client loop
         loop {
-            self.client_loop();
-        }
-    }
+            match self.status {
+                Status::AwaitingResponse(PacketType::Echo) if last_activity.elapsed() > timeout => {
+                    if tries < 3 {
+                        log::debug!("Checking with server again!");
+                        self.status = Status::SendData(PacketType::Echo, None);
+                        tries += 1;
+                        last_activity = Instant::now();
+                    } else {
+                        self.status = Status::Disconnect;
+                        tries = 0;
+                    }
+                }
+                Status::AwaitingResponse(PacketType::Echo) => {
+                    let bytes_read = Self::read_from_stream(&mut self.stream, &mut buf)
+                        .map_err(|_| Error::Custom("Could not read from stream".to_string()))?;
 
-    fn client_loop(&mut self) {
-        if let Some(stream) = self.stream.take() {
-            let (tx, rx) = mpsc::channel();
-            let read_stream = Arc::new(Mutex::new(stream));
-            let write_stream = Arc::clone(&read_stream);
+                    if bytes_read == 0 {
+                        self.status = Status::Disconnect;
+                    } else if bytes_read > 1 {
+                        if let Ok((packet_type, data)) = Self::process_bytes(&buf) {
+                            match packet_type {
+                                PacketType::Echo => {
+                                    self.status = Status::SendData(PacketType::Echo, None);
+                                }
+                                PacketType::Data => {
+                                    log::debug!("I have received Data! {:?}", data);
+                                }
+                                PacketType::Disconnect => {
+                                    log::debug!("Disconnecting from server");
+                                    return Ok(());
+                                }
+                                _ => todo!(),
+                            }
 
-            thread::spawn(move || {
-                Self::read_server(read_stream, tx);
-            });
-            thread::spawn(move || {
-                Self::write_to_server(write_stream, rx);
-                thread::sleep(Duration::from_secs(1));
-            });
-        }
-    }
-    fn write_to_server(stream: Arc<Mutex<TcpStream>>, rx: Receiver<TcpPacket>) {
-        let mut stream_lock: MutexGuard<TcpStream>;
-        let mut packet: TcpPacket;
+                            last_activity = Instant::now();
+                            tries = 0;
+                        }
+                    }
+                }
 
-        loop {
-            if let Ok(msg) = rx.recv() {
-                stream_lock = stream.lock().unwrap();
-                packet = msg;
-            } else {
-                break;
+                Status::AwaitingResponse(PacketType::Data) => {}
+
+                Status::SendData(PacketType::Echo, _) => {
+                    let buf = Self::data_to_packet(PacketType::Echo, None).map_err(|_| {
+                        Error::Custom("Could not convert data to packer".to_string())
+                    })?;
+
+                    let bytes = Self::write_to_stream(&mut self.stream, &buf)
+                        .map_err(|_| Error::Custom("Error at writing to stream".to_string()))?;
+
+                    if bytes <= 0 {
+                        log::warn!(
+                            "Something went wrong when writing to server. Wrote {bytes} bytes"
+                        );
+                    }
+                    log::debug!("Succesfully sent {bytes} bytes to server!!");
+                    last_activity = Instant::now();
+                    self.status = Status::AwaitingResponse(PacketType::Echo);
+                }
+
+                Status::SendData(PacketType::Data, Some(data)) => {}
+
+                Status::Disconnect => {
+                    log::warn!("Disconnecting from server");
+                    return Ok(());
+                }
+
+                _ => {}
             }
 
-            let packet = bincode::serialize(&packet).unwrap();
-
-            match stream_lock.write(&packet) {
-                Ok(n) => {
-                    log::info!("Written to server {n} bytes");
-                }
-                Err(e) => {
-                    eprintln!("Some unexpected error has happened {e}");
-                }
-            }
-
-            stream_lock.flush().unwrap();
+            self.stream.flush().expect("Could not flush stream");
+            buf = [0; 1024];
         }
     }
-    fn read_server(stream: Arc<Mutex<TcpStream>>, tx: Sender<TcpPacket>) {
-        let mut buf = [0; 1024];
-        let mut packet_length = 0;
-        let mut stream = stream.lock().unwrap();
 
-        loop {
-            match stream.read(&mut buf) {
-                Ok(n) => {
-                    packet_length = n;
-                    log::info!("New message from server. {n} bytes");
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    let echo_packet = TcpPacket::echo_packet(1);
-                    tx.send(echo_packet).unwrap();
+    fn data_to_packet(packet_type: PacketType, data: Option<Data>) -> Result<Vec<u8>> {
+        let data_len = bincode::serialize(&data)
+            .map_err(|_| Error::Custom("Could not serialize data".to_string()))?
+            .len();
 
-                    //log::info!("Server has not sent anything in {} period");
-                }
+        let tcp_packet = TcpPacket {
+            version: 1,
+            packet_type,
+            length: data_len as u8,
+            data,
+        };
 
-                Err(e) => {
-                    eprintln!("Some unexpected error has happened {e}");
-                }
+        bincode::serialize(&tcp_packet)
+            .map_err(|_| Error::Custom("Couldn't serialize tcp packet".to_string()))
+    }
+
+    fn write_to_stream(stream: &mut TcpStream, buf: &[u8]) -> Result<usize> {
+        let mut bytes_written = 0;
+
+        match stream.write(buf) {
+            Ok(0) => {
+                log::error!("Disconnect? ");
             }
+            Ok(n) => {
+                log::debug!("Writtent {n} bytes to server!");
+                bytes_written = n;
+            }
+            Err(e) => {
+                log::error!("Something went wrong when writing to server{e}")
+            }
+        }
 
-            let packet: TcpPacket = bincode::deserialize(&buf[..packet_length]).unwrap();
+        stream.flush().expect("Could not flush stream");
 
-            assert!(packet.version == 1, "Packet version does not match");
-            assert!(
-                packet.length == (packet_length - 3) as u8,
-                "Data length does not match one in TcpPacket"
-            );
-            tx.send(packet).unwrap();
-            stream.flush().unwrap();
+        Ok(bytes_written)
+    }
+
+    fn read_from_stream(stream: &mut TcpStream, buf: &mut [u8]) -> Result<usize> {
+        let mut len = 1;
+
+        match stream.read(buf) {
+            Ok(0) => {
+                log::warn!("Server has shutdown or disconnected");
+                return Ok(0);
+            }
+            Ok(n) => {
+                len = n;
+                log::debug!("Received message from server {n} bytes");
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                log::warn!("Read timeout reached!");
+            }
+            Err(e) => {
+                log::error!("Error at reading stream: {e}");
+            }
+        }
+
+        Ok(len)
+    }
+
+    fn process_bytes(buf: &[u8; 1024]) -> Result<(PacketType, Option<Data>)> {
+        let packet: TcpPacket = bincode::deserialize(buf)
+            .map_err(|e| Error::Custom(format!("Could not deserialize bytes to TcpPacket: {e}")))?;
+        log::debug!("Received packet: {:?}", packet);
+
+        assert!(packet.version == 1, "Wrong packet version used");
+
+        let data_len = bincode::serialize(&packet.data)
+            .map_err(|_| Error::Custom("Could not serialize data of packet".to_string()))?
+            .len();
+
+        match packet.packet_type {
+            PacketType::Echo => {
+                let packet_type = packet.packet_type;
+
+                Ok((packet_type, None))
+            }
+            PacketType::Data => {
+                let packet_type = packet.packet_type;
+                let data = packet.data;
+                assert!(
+                    packet.length == data_len as u8,
+                    "Packet's length does not match the data's"
+                );
+                Ok((packet_type, data))
+            }
+            PacketType::Disconnect => Ok((PacketType::Disconnect, None)),
+            _ => todo!(),
         }
     }
 }
